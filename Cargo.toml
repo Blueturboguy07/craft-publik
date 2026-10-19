@@ -1,0 +1,26 @@
+[package]
+name = "craft-publik"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "publik API as an AI provider option for the Craft apps: provisioning, the credential file, OpenAI-compatible calls, the own-key path, and an egui setup flow"
+repository = "https://github.com/Blueturboguy07/craft-publik"
+publish = false
+
+[features]
+default = []
+egui = ["dep:egui"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+egui = { version = "0.36", optional = true, default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
