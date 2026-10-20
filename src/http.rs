@@ -5,6 +5,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Default)]
 pub struct Response {
@@ -52,11 +53,18 @@ pub struct Request<'a> {
 }
 
 fn tmp_file(tag: &str) -> PathBuf {
+    // pid + clock alone collide when two requests start in the same clock tick (the clock is
+    // microseconds on macOS); a per-process counter keeps every name unique.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("craft-publik-{tag}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "craft-publik-{tag}-{}-{n}-{seq}",
+        std::process::id()
+    ))
 }
 
 struct TempFile(PathBuf);
