@@ -42,6 +42,9 @@ pub const MODEL_SMART: &str = "publik-smart";
 /// The image, transcription and speech lines have no tier alias; these are the
 /// names the gateway's price sheet carries for them.
 pub const IMAGE_MODEL: &str = "gpt-image-1";
+/// The second image line: Nano Banana (Google's image model) behind publik's alias on the
+/// Gemini line. publik API only; an own key has no Gemini line in this crate.
+pub const NANO_BANANA_MODEL: &str = "publik-image";
 pub const TRANSCRIBE_MODEL: &str = "whisper-1";
 pub const SPEECH_MODEL: &str = "tts-1";
 pub const DISCLOSURE_VERSION: u32 = 1;

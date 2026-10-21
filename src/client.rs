@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::http::{self, Body, Request, Response};
-use crate::{Line, Provider, IMAGE_MODEL, SPEECH_MODEL, TRANSCRIBE_MODEL};
+use crate::{Line, Provider, IMAGE_MODEL, NANO_BANANA_MODEL, SPEECH_MODEL, TRANSCRIBE_MODEL};
 
 /// A successful answer.
 #[derive(Clone, Debug, Default)]
@@ -315,6 +315,118 @@ pub fn image_edit(
     Ok(reply)
 }
 
+/// Nano Banana, text to image: one call to publik's Gemini line
+/// (`gemini/v1beta/models/publik-image:generateContent`). PNG or JPEG bytes back, plus any text
+/// the model adds. publik API only: an own key answers with a plain sentence and no request.
+pub fn image_generate_nano(p: &Provider, prompt: &str) -> Result<Reply, Fail> {
+    nano_request(p, json!([{"text": prompt}]))
+}
+
+/// Nano Banana, edit one image on disk (PNG, JPEG or WebP) by instruction.
+pub fn image_edit_nano(p: &Provider, prompt: &str, image: &Path) -> Result<Reply, Fail> {
+    nano_creds(p)?;
+    if !http::readable(image) {
+        return Err(Fail {
+            kind: "bad_input".into(),
+            message: "The image to edit could not be read.".into(),
+            ..Default::default()
+        });
+    }
+    let bytes = std::fs::read(image).map_err(|_| Fail {
+        kind: "bad_input".into(),
+        message: "The image to edit could not be read.".into(),
+        ..Default::default()
+    })?;
+    let mime = match image
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    };
+    nano_request(
+        p,
+        json!([{"inline_data": {"mime_type": mime, "data": base64(&bytes)}}, {"text": prompt}]),
+    )
+}
+
+fn nano_creds(p: &Provider) -> Result<(&str, &str), Fail> {
+    match p {
+        Provider::Publik { base_url, api_key, .. } => Ok((base_url, api_key)),
+        Provider::Own { .. } => Err(Fail {
+            status: 0,
+            kind: "unsupported".into(),
+            message: "Nano Banana runs through publik API only in this app. Choose GPT Image 1, or switch to publik API in Options.".into(),
+            ..Default::default()
+        }),
+        Provider::NotSetUp => Err(Fail::not_set_up()),
+    }
+}
+
+fn nano_request(p: &Provider, parts: Value) -> Result<Reply, Fail> {
+    let (base, key) = nano_creds(p)?;
+    let body = json!({
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]}
+    });
+    let res = http::send(&Request {
+        method: "POST",
+        url: &format!("{base}/gemini/v1beta/models/{NANO_BANANA_MODEL}:generateContent"),
+        bearer: Some(key),
+        headers: vec![],
+        body: Body::Json(&body),
+        timeout_secs: 300,
+    })
+    .map_err(Fail::transport)?;
+    let (res, mut reply) = finish(res, true)?;
+    let (bytes, text) = nano_parts(&res.json());
+    reply.text = text;
+    reply.bytes = bytes.ok_or_else(|| Fail {
+        status: res.status,
+        kind: "bad_image".into(),
+        message: "The service returned no image.".into(),
+        ..Default::default()
+    })?;
+    Ok(reply)
+}
+
+/// The first inline image (decoded) and the joined text of a `generateContent` answer. Both
+/// spellings of the part key are read (`inlineData` as Google writes it, `inline_data` as the
+/// REST docs show it).
+pub fn nano_parts(v: &Value) -> (Option<Vec<u8>>, String) {
+    let mut image = None;
+    let mut text = String::new();
+    let parts = v["candidates"][0]["content"]["parts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for part in parts {
+        if let Some(t) = part["text"].as_str() {
+            text.push_str(t);
+            continue;
+        }
+        if image.is_some() {
+            continue;
+        }
+        let inline = if part["inlineData"].is_object() {
+            &part["inlineData"]
+        } else {
+            &part["inline_data"]
+        };
+        let mime = inline["mimeType"]
+            .as_str()
+            .or_else(|| inline["mime_type"].as_str())
+            .unwrap_or("");
+        if mime.starts_with("image/") {
+            image = inline["data"].as_str().and_then(unbase64);
+        }
+    }
+    (image, text.trim().to_string())
+}
+
 /// Audio file → text (`whisper-1` line). `language` is an ISO-639-1 hint or empty.
 pub fn transcribe(p: &Provider, audio: &Path, language: &str) -> Result<Reply, Fail> {
     let (base, key, _, publik) = creds(p, Line::Transcribe)?;
@@ -445,6 +557,47 @@ pub fn unbase64(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nano_parts_reads_the_first_image_and_the_text() {
+        let v = json!({"candidates": [{"content": {"parts": [
+            {"text": "Here you go. "},
+            {"inlineData": {"mimeType": "image/png", "data": base64(b"first")}},
+            {"inline_data": {"mime_type": "image/jpeg", "data": base64(b"second")}},
+            {"text": "Done."}
+        ]}}]});
+        let (image, text) = nano_parts(&v);
+        assert_eq!(image.as_deref(), Some(&b"first"[..]));
+        assert_eq!(text, "Here you go. Done.");
+        let (image, text) =
+            nano_parts(&json!({"candidates": [{"content": {"parts": [{"text": "no image"}]}}]}));
+        assert!(image.is_none());
+        assert_eq!(text, "no image");
+        assert_eq!(nano_parts(&Value::Null), (None, String::new()));
+    }
+
+    #[test]
+    fn nano_banana_needs_publik_and_says_so_without_a_request() {
+        let own = Provider::Own {
+            service: crate::own_key::Service::OpenAi,
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-x".into(),
+            model: "gpt-4o".into(),
+        };
+        let err = image_generate_nano(&own, "a cat").unwrap_err();
+        assert_eq!(err.kind, "unsupported");
+        assert!(
+            err.message
+                .starts_with("Nano Banana runs through publik API only"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains('{'));
+        let err = image_generate_nano(&Provider::NotSetUp, "a cat").unwrap_err();
+        assert_eq!(err.kind, "not_set_up");
+        let err = image_edit_nano(&own, "bluer", Path::new("/nonexistent.png")).unwrap_err();
+        assert_eq!(err.kind, "unsupported");
+    }
 
     #[test]
     fn base64_round_trips() {
