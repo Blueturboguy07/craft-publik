@@ -67,6 +67,10 @@ pub struct AiState {
     pub advanced: bool,
     probed: Option<Vec<String>>,
     rx: Option<Receiver<Event>>,
+    /// One live read of the wallet per session, so the balance line is not the snapshot from
+    /// minting ("$0.00 · link this computer…" on a computer that was linked weeks ago).
+    wallet_rx: Option<Receiver<Result<(Option<i64>, String), String>>>,
+    wallet_checked: bool,
 }
 
 impl AiState {
@@ -88,6 +92,8 @@ impl AiState {
             advanced: false,
             probed: None,
             rx: None,
+            wallet_rx: None,
+            wallet_checked: false,
         };
         s.key_draft = s.settings.own_key.clone();
         s.base_url_draft = s.settings.own_base_url.clone();
@@ -124,8 +130,54 @@ impl AiState {
         }
     }
 
+    /// Read the live balance and claim state once per session, in the background. The pane
+    /// keeps showing the credential's snapshot until the answer lands; a failed read changes
+    /// nothing. Safe to call every frame.
+    pub fn refresh_wallet(&mut self, ctx: &egui::Context) {
+        if self.wallet_checked || self.credential.is_none() {
+            return;
+        }
+        let p = self.provider();
+        if !p.is_publik() {
+            return;
+        }
+        self.wallet_checked = true;
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        self.wallet_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = crate::client::wallet(&p)
+                .map(|v| {
+                    (
+                        v["balance_micros"].as_i64(),
+                        v["claim_state"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .map_err(|f| f.message);
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+    }
+
     /// Drain finished background work. Call once per frame before drawing.
     pub fn poll(&mut self) {
+        if let Some(wrx) = self.wallet_rx.take() {
+            match wrx.try_recv() {
+                Ok(Ok((micros, state))) => {
+                    if let Some(c) = &mut self.credential {
+                        if micros.is_some() {
+                            c.balance_micros = micros;
+                        }
+                        if !state.is_empty() {
+                            c.claim_state = state;
+                        }
+                        let _ = credential::write(self.app.slug, c);
+                    }
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.wallet_rx = Some(wrx),
+            }
+        }
         let Some(rx) = self.rx.take() else { return };
         let mut done = false;
         loop {
@@ -281,6 +333,7 @@ impl AiState {
     pub fn setup_ui(&mut self, ui: &mut Ui) -> Action {
         self.poll();
         let ctx = ui.ctx().clone();
+        self.refresh_wallet(&ctx);
         ui.set_max_width(460.0);
         match self.step {
             Step::Pick => self.pick_ui(ui),
@@ -509,6 +562,7 @@ impl AiState {
     /// The AI section of the app's Options page. `open_setup` is set when the person wants the flow.
     pub fn options_ui(&mut self, ui: &mut Ui, open_setup: &mut bool) -> Action {
         self.poll();
+        self.refresh_wallet(ui.ctx());
         let mut action = Action::None;
         let p = self.provider();
         let cred = self.credential.clone();
@@ -586,6 +640,8 @@ impl AiState {
 
     /// A small bar a feature shows under its result: the notice (with its one link) or the charge.
     pub fn result_bar(&mut self, ui: &mut Ui) -> Action {
+        self.refresh_wallet(ui.ctx());
+        self.poll();
         let mut action = Action::None;
         if let Some(n) = self.notice.clone() {
             ui.colored_label(ui.visuals().warn_fg_color, &n.message);
