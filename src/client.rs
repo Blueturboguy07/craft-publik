@@ -555,6 +555,7 @@ pub fn unbase64(s: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

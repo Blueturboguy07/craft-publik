@@ -132,8 +132,6 @@ pub fn start(app: &AppInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn the_events_and_the_path_are_the_contracts() {
         let e = crate::Endpoints::DEFAULT;

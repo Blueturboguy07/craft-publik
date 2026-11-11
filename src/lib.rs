@@ -10,9 +10,10 @@
 //! shows. Each app names itself in its own source (`AppInfo`: its `APP_SLUG`, version,
 //! `USES_AI`, token and endpoints) and runs the gate at start-up, before any screen it owns.
 //!
-//! Resolution order: the person's stored answer to the plan screen decides. "Use my own key"
-//! > `PUBLIK_API_KEY` / `PUBLIK_API_BASE_URL` in the environment (development) > "Connect your
-//! plan" with this app's credential file > nothing usable yet (the tools ask for a key).
+//! Resolution order: the person's stored answer to the plan screen decides. First "Use my own
+//! key"; then `PUBLIK_API_KEY` / `PUBLIK_API_BASE_URL` in the environment (development); then
+//! "Connect your plan" with this app's credential file; else nothing usable yet (the tools ask
+//! for a key).
 //!
 //! Copy rule (publik contract): "publik API", dollars, never tokens, never "credits" as a unit,
 //! never the model vendor's name next to a price.
