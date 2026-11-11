@@ -79,11 +79,23 @@ pub fn set_choice(slug: &str, choice: Option<&str>) -> Result<(), String> {
         return Ok(());
     };
     c.choice = choice.map(str::to_string);
-    write(slug, &c)
+    write_raw(slug, &c)
 }
 
-/// Writes the file with the key before anything else sees it.
+/// Writes the file with the key before anything else sees it. A copy that carries no `choice`
+/// (read before the gate stored one) keeps the choice on disk: only `set_choice` clears it.
 pub fn write(slug: &str, c: &Credential) -> Result<(), String> {
+    if c.choice.is_none() {
+        if let Some(on_disk) = read(slug).and_then(|d| d.choice) {
+            let mut kept = c.clone();
+            kept.choice = Some(on_disk);
+            return write_raw(slug, &kept);
+        }
+    }
+    write_raw(slug, c)
+}
+
+fn write_raw(slug: &str, c: &Credential) -> Result<(), String> {
     let path = path(slug).ok_or("no home directory")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -196,6 +208,27 @@ mod tests {
         assert!(is_uuid_v4("3f0c2a52-7a1e-4c1b-9a53-0b6c0e1d2f44"));
         assert!(!is_uuid_v4("3f0c2a52-7a1e-1c1b-9a53-0b6c0e1d2f44"));
         assert!(!is_uuid_v4("not-a-uuid"));
+    }
+
+    #[test]
+    fn a_write_without_a_choice_keeps_the_choice_on_disk() {
+        // A slug no app uses, under this user's publik folder; removed at the end.
+        let slug = "craft-publik-unit-test-choice-merge";
+        let c = Credential {
+            key: "pk_unit_test".into(),
+            ..Default::default()
+        };
+        if write_raw(slug, &c).is_err() {
+            return; // no home directory here (a sandbox): nothing to check
+        }
+        let _ = set_choice(slug, Some("publik"));
+        let _ = write(slug, &c);
+        let kept = read(slug).and_then(|d| d.choice);
+        let _ = set_choice(slug, None);
+        let cleared = read(slug).and_then(|d| d.choice);
+        forget(slug);
+        assert_eq!(kept.as_deref(), Some("publik"));
+        assert_eq!(cleared, None);
     }
 
     #[test]
