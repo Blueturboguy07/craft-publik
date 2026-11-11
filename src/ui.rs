@@ -25,7 +25,6 @@ use crate::{
 /// The screen the gate worker wants on screen, and where the press goes.
 struct Shown {
     screen: Screen,
-    done: Arc<AtomicBool>,
     pressed: Arc<Mutex<Option<&'static str>>>,
 }
 
@@ -40,7 +39,6 @@ impl GateUi for SlotUi {
         let pressed = Arc::new(Mutex::new(None));
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Shown {
             screen: screen.clone(),
-            done: done.clone(),
             pressed: pressed.clone(),
         });
         let answer = loop {
@@ -231,9 +229,12 @@ pub struct Notice {
 }
 
 enum Event {
-    Provisioned(Result<Credential, String>),
+    Provisioned(Box<Result<Credential, String>>),
     Probed(Result<Vec<String>, String>),
 }
+
+/// The live balance and claim state, or why the read failed.
+type WalletRead = Result<(Option<i64>, String), String>;
 
 pub struct AiState {
     pub app: AppInfo,
@@ -253,7 +254,7 @@ pub struct AiState {
     rx: Option<Receiver<Event>>,
     /// One live read of the wallet per session, so the balance line is not the snapshot from
     /// minting ("$0.00 · link this computer…" on a computer that was linked weeks ago).
-    wallet_rx: Option<Receiver<Result<(Option<i64>, String), String>>>,
+    wallet_rx: Option<Receiver<WalletRead>>,
     wallet_checked: bool,
 }
 
@@ -398,14 +399,16 @@ impl AiState {
             };
             done = true;
             match ev {
-                Event::Provisioned(Ok(c)) => {
-                    self.credential = Some(c);
-                    self.use_publik();
-                }
-                Event::Provisioned(Err(e)) => {
-                    self.error = Some(e);
-                    self.step = Step::Pick;
-                }
+                Event::Provisioned(r) => match *r {
+                    Ok(c) => {
+                        self.credential = Some(c);
+                        self.use_publik();
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.step = Step::Pick;
+                    }
+                },
                 Event::Probed(Ok(ids)) => {
                     let service = Service::detect(&self.key_draft);
                     if self.model_draft.trim().is_empty() {
@@ -462,7 +465,7 @@ impl AiState {
         self.step = Step::Provisioning;
         std::thread::spawn(move || {
             let r = crate::provision::provision(&app);
-            let _ = tx.send(Event::Provisioned(r));
+            let _ = tx.send(Event::Provisioned(Box::new(r)));
             ctx.request_repaint();
         });
     }
