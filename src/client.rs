@@ -56,7 +56,7 @@ impl Fail {
         }
     }
     pub fn not_set_up() -> Self {
-        Fail { status: 0, kind: "not_set_up".into(), message: "AI is not set up on this computer yet. Choose publik API or paste your own key in Options.".into(), ..Default::default() }
+        Fail { status: 0, kind: "not_set_up".into(), message: "AI is not set up on this computer yet. Connect your publik plan or paste your own key in Options.".into(), ..Default::default() }
     }
     pub fn unsupported(line: Line) -> Self {
         let what = match line {

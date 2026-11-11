@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  DO_NOT_TRACK: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy (no features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (egui)
+        run: cargo clippy --all-targets --features egui -- -D warnings
+      - name: test
+        run: cargo test --all-features

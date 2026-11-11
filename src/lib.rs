@@ -1,29 +1,33 @@
-//! publik API as one AI provider option for a Craft app.
+//! publik for a Craft app: Sign in with publik, usage counting, and publik API as one AI
+//! provider option next to the person's own key.
 //!
-//! What this crate owns: the per-app credential file publik writes on this
-//! computer, provisioning (`POST /installs` with the app's public token), the
-//! OpenAI-compatible calls (chat, images, transcription, speech), the person's
-//! own-key path, and (behind the `egui` feature) the setup flow every Craft app
-//! shows on first launch and in its preferences.
+//! Every app on publik opens with Sign in with publik. This crate is the publik module
+//! (publikhq.com/sdk/publik.rs.md) for the Craft apps, shared instead of copied: the gate
+//! (`gate::ensure_signed_in`), usage counting (`telemetry`), provisioning (`POST /installs`
+//! with the app's public token), the per-app credential file publik writes on this computer,
+//! the OpenAI-compatible calls (chat, images, transcription, speech), the person's own-key
+//! path, and (behind the `egui` feature) the gate panel and the AI settings every Craft app
+//! shows. Each app names itself in its own source (`AppInfo`: its `APP_SLUG`, version,
+//! `USES_AI`, token and endpoints) and runs the gate at start-up, before any screen it owns.
 //!
-//! Resolution order (publikhq.com/sdk/publik.rs.md): the person's own key >
-//! `PUBLIK_API_KEY` / `PUBLIK_API_BASE_URL` in the environment > this app's
-//! credential file > provision on first launch, after the disclosure is
-//! accepted > the own key again if provisioning fails.
+//! Resolution order: the person's stored answer to the plan screen decides. "Use my own key"
+//! > `PUBLIK_API_KEY` / `PUBLIK_API_BASE_URL` in the environment (development) > "Connect your
+//! plan" with this app's credential file > nothing usable yet (the tools ask for a key).
 //!
-//! Copy rule (publik contract): "publik API", dollars, never tokens, never
-//! "credits" as a unit, never the model vendor's name next to a price.
+//! Copy rule (publik contract): "publik API", dollars, never tokens, never "credits" as a unit,
+//! never the model vendor's name next to a price.
 //!
-//! HTTP goes through the system `curl` (macOS, Windows 10+ and Linux ship it),
-//! so no TLS crate joins the app. A key only ever rides a curl config on stdin,
-//! never argv.
+//! HTTP goes through the system `curl` (macOS, Windows 10+ and Linux ship it), so no TLS crate
+//! joins the app. A key only ever rides a curl config on stdin, never argv.
 
 pub mod client;
 pub mod credential;
+pub mod gate;
 pub mod http;
 pub mod own_key;
 pub mod provision;
 pub mod settings;
+pub mod telemetry;
 #[cfg(feature = "egui")]
 pub mod ui;
 
@@ -31,8 +35,11 @@ use std::path::PathBuf;
 
 pub use client::{Fail, Reply};
 pub use credential::Credential;
+pub use gate::{GateUi, Passed, Screen};
 pub use settings::AiSettings;
 
+/// publik's origin. `PUBLIK_ORIGIN` overrides it (tests only).
+pub const DEFAULT_ORIGIN: &str = "https://publikhq.com";
 pub const DEFAULT_BASE_URL: &str = "https://publikhq.com/api/v1";
 pub const DASHBOARD_URL: &str = "https://publikhq.com/dashboard/api";
 /// Tier aliases. Ask for a tier, never a vendor model name.
@@ -49,7 +56,7 @@ pub const TRANSCRIBE_MODEL: &str = "whisper-1";
 pub const SPEECH_MODEL: &str = "tts-1";
 pub const DISCLOSURE_VERSION: u32 = 1;
 
-/// The two-sentence disclosure shown before provisioning. Never promises a starter.
+/// The two-sentence disclosure of publik API, for an app's settings page. Never promises a starter.
 pub const DISCLOSURE: &str = "This app can use publik API for its AI features: no key to paste, priced per use in dollars from a publik balance that starts at $0.00. Linking this computer to a publik account gives $0.05 of free use, once. Your prompts go through publik's servers to the model; you can switch to your own key at any time.";
 pub const DISCLOSURE_DATA: &str = "What you send to an AI feature goes through publik's servers to a shared model account. publik never trains on it and does not store it. Everything else in this app stays on this computer.";
 /// The one-sentence justification shown wherever money is mentioned, when the
@@ -59,18 +66,82 @@ pub const CTA_SIGN_IN: &str = "Sign in with publik";
 pub const CTA_ADD_PLAN: &str = "Add a plan or pack";
 pub const CTA_LATER: &str = "Later";
 
-/// What the host app tells this crate about itself.
+/// The publik paths and event names the module calls. The app writes them in its own source,
+/// next to its `APP_SLUG` (publik's scan reads the module's endpoints and its slug from one
+/// file of the app); `Endpoints::DEFAULT` is the contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Endpoints {
+    /// `POST`: this computer's key.
+    pub installs: &'static str,
+    /// `GET`: the claim state, account, plan and balance.
+    pub wallet: &'static str,
+    /// `POST`: one usage event.
+    pub telemetry: &'static str,
+    /// The event sent once the gate passed.
+    pub opened: &'static str,
+    /// The event sent every 30 minutes after it.
+    pub active: &'static str,
+}
+
+impl Endpoints {
+    pub const DEFAULT: Endpoints = Endpoints {
+        installs: "/api/v1/installs",
+        wallet: "/api/v1/wallet",
+        telemetry: "/api/v1/telemetry",
+        opened: "app_opened",
+        active: "active_session",
+    };
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The person's answer to the plan screen of the gate, kept in the credential file (`choice`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// "Connect your plan": the install key pays, from the person's publik plan or balance.
+    Publik,
+    /// "Use my own key": the person's own key at its own service, exactly as before.
+    OwnKey,
+}
+
+impl Choice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publik => "publik",
+            Self::OwnKey => "own_key",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "publik" => Some(Self::Publik),
+            "own_key" => Some(Self::OwnKey),
+            _ => None,
+        }
+    }
+}
+
+/// What the host app tells this crate about itself. The app writes these in its own source.
 #[derive(Clone, Debug)]
 pub struct AppInfo {
     /// publik listing slug (`gridcraft`). Also the credential file's name.
     pub slug: &'static str,
     /// Display name (`GridCraft`).
     pub name: &'static str,
-    /// `env!("CARGO_PKG_VERSION")`.
+    /// The release version, as the listing shows it (`0.9.0-publik.4`).
     pub version: &'static str,
     /// The app's public `pat_` token, compiled in from `publik-app-token.txt`.
-    /// Empty means this build has no publik option; the own key still works.
+    /// Empty means this build has no token: the gate says so and cannot pass.
     pub app_token: &'static str,
+    /// False: the app calls no model. It still signs in and counts users, and it skips the
+    /// plan screen.
+    pub uses_ai: bool,
+    /// The paths and events the module calls (`Endpoints::DEFAULT`).
+    pub endpoints: Endpoints,
     /// The gateway dialects this app uses, reported at provisioning
     /// (`chat_completions`, `images`, `audio_transcriptions`, `audio_speech`).
     pub dialects: &'static [&'static str],
@@ -110,7 +181,7 @@ pub enum Provider {
         api_key: String,
         model: String,
     },
-    /// Nothing usable yet: the setup flow has not run, or was declined.
+    /// Nothing usable yet: no plan is connected and no own key is pasted.
     NotSetUp,
 }
 
@@ -164,6 +235,24 @@ impl Line {
     }
 }
 
+/// publik's origin: `PUBLIK_ORIGIN` (tests only), else publikhq.com.
+pub fn origin() -> String {
+    std::env::var("PUBLIK_ORIGIN")
+        .ok()
+        .and_then(|s| trim_url(&s))
+        .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
+}
+
+/// `origin()` + a path such as `Endpoints::DEFAULT.wallet`.
+pub fn api_url(path: &str) -> String {
+    format!("{}{path}", origin())
+}
+
+/// The gateway's base URL at the origin in force.
+pub fn default_base_url() -> String {
+    format!("{}/api/v1", origin())
+}
+
 /// `PUBLIK_API_BASE_URL` (dev) > the provisioning reply's `base_url` > the default.
 pub fn resolve_base_url(from_credential: &str) -> String {
     if let Some(u) = std::env::var("PUBLIK_API_BASE_URL")
@@ -172,7 +261,7 @@ pub fn resolve_base_url(from_credential: &str) -> String {
     {
         return u;
     }
-    trim_url(from_credential).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    trim_url(from_credential).unwrap_or_else(default_base_url)
 }
 
 fn trim_url(s: &str) -> Option<String> {
@@ -184,9 +273,29 @@ fn trim_url(s: &str) -> Option<String> {
     }
 }
 
+/// The stored answer to the plan screen: the credential file's `choice`, or, for a computer set
+/// up before the gate, the provider `ai.json` named (`own` or `publik`). None: not answered yet.
+pub fn choice(app: &AppInfo, settings: &AiSettings) -> Option<Choice> {
+    if let Some(c) = credential::read_choice(app.slug) {
+        return Some(c);
+    }
+    match settings.provider.as_str() {
+        settings::PROVIDER_OWN => Some(Choice::OwnKey),
+        settings::PROVIDER_PUBLIK => Some(Choice::Publik),
+        _ => None,
+    }
+}
+
+/// Store the answer to the plan screen: `Some(Choice::Publik)`, `Some(Choice::OwnKey)`, or
+/// `None` to ask again at the next gate (a setting calls it; see `gate::ask_again`).
+pub fn set_choice(app: &AppInfo, choice: Option<Choice>) {
+    let _ = credential::set_choice(app.slug, choice.map(Choice::as_str));
+}
+
 /// The provider in force, by the resolution order above. Pure: reads files, never the network.
 pub fn resolve(app: &AppInfo, settings: &AiSettings) -> Provider {
-    if settings.provider == settings::PROVIDER_OWN {
+    let choice = choice(app, settings);
+    if choice == Some(Choice::OwnKey) {
         let key = settings.own_key.trim();
         if !key.is_empty() {
             let service = own_key::Service::detect(key);
@@ -204,6 +313,7 @@ pub fn resolve(app: &AppInfo, settings: &AiSettings) -> Provider {
                 model,
             };
         }
+        return Provider::NotSetUp;
     }
     if let Ok(k) = std::env::var("PUBLIK_API_KEY") {
         let k = k.trim().to_string();
@@ -215,7 +325,7 @@ pub fn resolve(app: &AppInfo, settings: &AiSettings) -> Provider {
             };
         }
     }
-    if settings.provider == settings::PROVIDER_PUBLIK || settings.provider.is_empty() {
+    if choice == Some(Choice::Publik) {
         if let Some(c) = credential::read(app.slug) {
             return Provider::Publik {
                 base_url: resolve_base_url(&c.base_url),
@@ -227,16 +337,10 @@ pub fn resolve(app: &AppInfo, settings: &AiSettings) -> Provider {
     Provider::NotSetUp
 }
 
-/// Builder check, run by the BUILT app: start it with `PUBLIK_SELF_TEST=1`,
-/// print this line, exit. It provisions for real; the builder who runs it is the consent.
+/// Builder check, run by the BUILT app: `PUBLIK_SELF_TEST=1` makes the gate print this line and
+/// exit. It provisions for real and reads the wallet; the builder who runs it is the consent.
 pub fn self_test(app: &AppInfo) -> String {
-    match provision::provision(app) {
-        Ok(c) => format!(
-            "publik self-test: ok {} {} (install {:.8})",
-            app.slug, app.version, c.install_id
-        ),
-        Err(e) => format!("publik self-test: failed: {e}"),
-    }
+    gate::self_test(app)
 }
 
 /// Dollars from micros, two decimals (`$0.05`).
@@ -249,7 +353,7 @@ pub fn dollars(micros: i64) -> String {
     }
 }
 
-/// First-run card, line 1. A new install is $0.00 until it is linked.
+/// The balance line of the settings page. A new install is $0.00 until it is linked.
 pub fn balance_line(micros: Option<i64>, claim_state: &str) -> String {
     let Some(m) = micros else {
         return String::new();
@@ -261,10 +365,11 @@ pub fn balance_line(micros: Option<i64>, claim_state: &str) -> String {
     }
 }
 
-/// The only host a claim or top-up link may point at. Anything else is dropped.
+/// The only host a claim or top-up link may point at (publikhq.com, or `PUBLIK_ORIGIN` in
+/// tests). Anything else is dropped.
 pub fn publik_link(s: Option<&str>) -> Option<String> {
     let s = s?.trim();
-    if s.starts_with("https://publikhq.com/") {
+    if s.starts_with("https://publikhq.com/") || s.starts_with(&format!("{}/", origin())) {
         Some(s.to_string())
     } else {
         None
@@ -303,5 +408,52 @@ mod tests {
         assert_eq!(dollars(50_000), "$0.05");
         assert_eq!(dollars(1_200), "$0.0012");
         assert_eq!(dollars(0), "$0.00");
+    }
+
+    #[test]
+    fn choices_round_trip_as_the_credential_stores_them() {
+        assert_eq!(Choice::parse("publik"), Some(Choice::Publik));
+        assert_eq!(Choice::parse(" own_key "), Some(Choice::OwnKey));
+        assert_eq!(Choice::parse("later"), None);
+        assert_eq!(Choice::Publik.as_str(), "publik");
+        assert_eq!(Choice::OwnKey.as_str(), "own_key");
+    }
+
+    #[test]
+    fn the_default_endpoints_are_the_contract() {
+        let e = Endpoints::default();
+        assert_eq!(e.installs, "/api/v1/installs");
+        assert_eq!(e.wallet, "/api/v1/wallet");
+        assert_eq!(e.telemetry, "/api/v1/telemetry");
+        assert_eq!(e.opened, "app_opened");
+        assert_eq!(e.active, "active_session");
+        assert_eq!(api_url(e.wallet), format!("{}/api/v1/wallet", origin()));
+    }
+
+    #[test]
+    fn an_own_key_choice_without_a_key_is_not_set_up() {
+        let app = AppInfo {
+            slug: "craft-publik-unit-test-no-credential",
+            name: "Test",
+            version: "0.0.0",
+            app_token: "",
+            uses_ai: true,
+            endpoints: Endpoints::DEFAULT,
+            dialects: &["chat_completions"],
+            config_dir: None,
+        };
+        let empty = AiSettings {
+            provider: settings::PROVIDER_OWN.into(),
+            ..Default::default()
+        };
+        assert_eq!(choice(&app, &empty), Some(Choice::OwnKey));
+        assert_eq!(resolve(&app, &empty), Provider::NotSetUp);
+        let with_key = AiSettings {
+            provider: settings::PROVIDER_OWN.into(),
+            own_key: "sk-proj-unit".into(),
+            ..Default::default()
+        };
+        assert!(matches!(resolve(&app, &with_key), Provider::Own { .. }));
+        assert_eq!(choice(&app, &AiSettings::default()), None);
     }
 }

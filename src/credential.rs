@@ -2,6 +2,8 @@
 //! `~/Library/Application Support/publik/apps/<slug>.json` (macOS),
 //! `%LOCALAPPDATA%\publik\apps\<slug>.json` (Windows),
 //! `${XDG_CONFIG_HOME:-~/.config}/publik/apps/<slug>.json` (Linux). Mode 0600.
+//! The `publik` folder above `apps` is shared by every publik app (`telemetry.json`,
+//! `consent.json`).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,13 +18,16 @@ pub struct Credential {
     pub claim_url: String,
     pub add_credit_url: String,
     pub claim_state: String,
-    /// `disclosure.cost` from the provisioning reply, shown verbatim on the card.
+    /// `disclosure.cost` from the provisioning reply, shown verbatim on the settings page.
     pub cost_sentence: String,
     pub balance_micros: Option<i64>,
     pub minted_at: String,
+    /// The answer to the gate's plan screen: `publik`, `own_key`, or none (ask again).
+    pub choice: Option<String>,
 }
 
-pub fn dir() -> Option<PathBuf> {
+/// The publik folder of this computer account, shared by every publik app.
+pub fn publik_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)?;
@@ -37,7 +42,12 @@ pub fn dir() -> Option<PathBuf> {
             .map(PathBuf::from)
             .unwrap_or(home.join(".config"))
     };
-    Some(base.join("publik").join("apps"))
+    Some(base.join("publik"))
+}
+
+/// The `apps` folder: one credential file per app.
+pub fn dir() -> Option<PathBuf> {
+    Some(publik_dir()?.join("apps"))
 }
 
 pub fn path(slug: &str) -> Option<PathBuf> {
@@ -55,6 +65,21 @@ pub fn read(slug: &str) -> Option<Credential> {
         c.app_slug = slug.to_string();
     }
     Some(c)
+}
+
+/// The stored answer to the plan screen, when the credential holds one.
+pub fn read_choice(slug: &str) -> Option<crate::Choice> {
+    read(slug)?.choice.as_deref().and_then(crate::Choice::parse)
+}
+
+/// Store the answer to the plan screen (`publik`, `own_key`, or `None` to ask again). Nothing
+/// happens without a credential: the gate stores the answer once the key is there.
+pub fn set_choice(slug: &str, choice: Option<&str>) -> Result<(), String> {
+    let Some(mut c) = read(slug) else {
+        return Ok(());
+    };
+    c.choice = choice.map(str::to_string);
+    write(slug, &c)
 }
 
 /// Writes the file with the key before anything else sees it.
@@ -100,8 +125,8 @@ pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
     }
 }
 
-/// 16 random bytes as a v4 UUID string: the mint's idempotency key. No crate:
-/// the OS random source through `RandomState`, mixed over several draws.
+/// 16 random bytes as a v4 UUID string: the mint's idempotency key and the telemetry install
+/// ID. No crate: the OS random source through `RandomState`, mixed over several draws.
 pub fn new_install_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -141,6 +166,21 @@ pub fn new_install_id() -> String {
     )
 }
 
+/// A lower-case v4 UUID, as `telemetry.json` must hold it.
+pub fn is_uuid_v4(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                *c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+        && b[14] == b'4'
+        && b"89abAB".contains(&b[19])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +192,17 @@ mod tests {
         assert_eq!(a.len(), 36);
         assert_eq!(&a[14..15], "4");
         assert_ne!(a, b);
+        assert!(is_uuid_v4(&a));
+        assert!(is_uuid_v4("3f0c2a52-7a1e-4c1b-9a53-0b6c0e1d2f44"));
+        assert!(!is_uuid_v4("3f0c2a52-7a1e-1c1b-9a53-0b6c0e1d2f44"));
+        assert!(!is_uuid_v4("not-a-uuid"));
+    }
+
+    #[test]
+    fn an_old_file_loads_without_a_choice() {
+        let c: Credential =
+            serde_json::from_str(r#"{"key":"pk_x","claim_state":"claimed"}"#).unwrap_or_default();
+        assert_eq!(c.key, "pk_x");
+        assert_eq!(c.choice, None);
     }
 }

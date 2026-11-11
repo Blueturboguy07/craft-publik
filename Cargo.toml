@@ -1,10 +1,10 @@
 [package]
 name = "craft-publik"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "publik API as an AI provider option for the Craft apps: provisioning, the credential file, OpenAI-compatible calls, the own-key path, and an egui setup flow"
+description = "The publik module for the Craft apps: Sign in with publik (the gate), usage counting, provisioning, the credential file, OpenAI-compatible calls, the own-key path, and the egui gate panel and setup flow"
 repository = "https://github.com/Blueturboguy07/craft-publik"
 publish = false
 

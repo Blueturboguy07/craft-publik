@@ -1,21 +1,216 @@
-//! The egui setup flow every Craft app shows on first launch and in its
-//! preferences: two cards (publik API, your own key), the two-sentence
-//! disclosure, provisioning, the first-run card (balance line, cost sentence,
-//! Sign in with publik), and the own-key form. The host renders it inside its
-//! own window; this module never opens windows and never opens URLs itself.
+//! The egui side of the publik module: the gate panel every Craft app draws before its own UI
+//! (`Gate`), and the AI settings every Craft app shows in its preferences (`AiState`: the two
+//! cards publik API / your own key, the disclosure, the first-run card, the own-key form).
+//! The host renders both inside its own window; this module never opens windows itself.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use egui::{RichText, Ui};
 
 use crate::client::{Fail, Reply};
 use crate::credential::{self, Credential};
+use crate::gate::{self, GateUi, Passed, Screen};
 use crate::own_key::{self, Service};
 use crate::settings::{AiSettings, PROVIDER_OWN, PROVIDER_PUBLIK};
 use crate::{
-    AppInfo, Provider, CTA_ADD_PLAN, CTA_LATER, CTA_SIGN_IN, DISCLOSURE, DISCLOSURE_DATA,
+    AppInfo, Choice, Provider, CTA_ADD_PLAN, CTA_LATER, CTA_SIGN_IN, DISCLOSURE, DISCLOSURE_DATA,
     DISCLOSURE_VERSION, WHY_IT_COSTS,
 };
+
+// ---- the gate ---------------------------------------------------------------------------------
+
+/// The screen the gate worker wants on screen, and where the press goes.
+struct Shown {
+    screen: Screen,
+    done: Arc<AtomicBool>,
+    pressed: Arc<Mutex<Option<&'static str>>>,
+}
+
+/// `GateUi` over a shared slot: the worker thread parks a screen in it, the egui host draws the
+/// slot each frame and writes the pressed button back.
+struct SlotUi {
+    slot: Arc<Mutex<Option<Shown>>>,
+}
+
+impl GateUi for SlotUi {
+    fn show(&mut self, screen: &Screen, done: Arc<AtomicBool>) -> Option<&'static str> {
+        let pressed = Arc::new(Mutex::new(None));
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Shown {
+            screen: screen.clone(),
+            done: done.clone(),
+            pressed: pressed.clone(),
+        });
+        let answer = loop {
+            if let Some(id) = pressed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                break Some(id);
+            }
+            if done.load(Ordering::SeqCst) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        answer
+    }
+
+    fn open_url(&mut self, url: &str) {
+        gate::open_in_browser(url);
+    }
+}
+
+/// Sign in with publik, for an egui app: `gate::ensure_signed_in` on a worker thread, drawn by
+/// the host each frame until it passes.
+///
+/// ```ignore
+/// // in the app's state:
+/// gate: craft_publik::ui::Gate::new(app_info()),
+/// // first thing in the frame, before any UI the app owns:
+/// if !self.gate.ui(ui) { return; }
+/// ```
+pub struct Gate {
+    app: AppInfo,
+    slot: Arc<Mutex<Option<Shown>>>,
+    rx: Option<Receiver<Passed>>,
+    passed: Option<Passed>,
+}
+
+impl Gate {
+    /// Starts the gate at once, on a worker thread.
+    pub fn new(app: AppInfo) -> Self {
+        let mut g = Gate {
+            app,
+            slot: Arc::new(Mutex::new(None)),
+            rx: None,
+            passed: None,
+        };
+        g.start();
+        g
+    }
+
+    fn start(&mut self) {
+        let (tx, rx) = channel();
+        let app = self.app.clone();
+        let mut ui = SlotUi {
+            slot: self.slot.clone(),
+        };
+        self.rx = Some(rx);
+        self.passed = None;
+        std::thread::spawn(move || {
+            let p = gate::ensure_signed_in(&app, &mut ui);
+            let _ = tx.send(p);
+        });
+    }
+
+    /// True once the gate passed in this process.
+    pub fn passed(&self) -> bool {
+        self.passed.is_some()
+    }
+
+    /// The wallet and the choice the gate saw, once it passed.
+    pub fn result(&self) -> Option<&Passed> {
+        self.passed.as_ref()
+    }
+
+    /// Drive the gate without drawing (a host that draws the gate itself). True: passed.
+    pub fn poll(&mut self) -> bool {
+        if let Some(p) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.passed = Some(p);
+            self.rx = None;
+        }
+        if self.rx.is_none() && gate::take_ask_again() {
+            self.start();
+        }
+        self.passed.is_some()
+    }
+
+    /// Draw the gate into `ui` when it has not passed. Returns true when the host may draw its
+    /// own UI (the gate passed), false when the gate is on screen.
+    pub fn ui(&mut self, ui: &mut Ui) -> bool {
+        if self.poll() {
+            return true;
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+        let shown = self
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|s| (s.screen.clone(), s.pressed.clone()));
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.25).max(24.0));
+            ui.set_max_width(460.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width().min(428.0));
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| match &shown {
+                            None => {
+                                ui.label(RichText::new("Sign in with publik").heading());
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Connecting to publik…");
+                                });
+                            }
+                            Some((s, pressed)) => {
+                                ui.label(RichText::new(s.title).heading());
+                                ui.add_space(6.0);
+                                ui.label(&s.body);
+                                if let Some(n) = s.note {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if n.starts_with("Waiting") {
+                                            ui.spinner();
+                                        }
+                                        ui.label(RichText::new(n).weak());
+                                    });
+                                }
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    for (i, (id, label)) in s.buttons.iter().enumerate() {
+                                        let clicked = if i == 0 {
+                                            AiState::primary(ui, label).clicked()
+                                        } else {
+                                            ui.button(*label).clicked()
+                                        };
+                                        if clicked {
+                                            *pressed
+                                                .lock()
+                                                .unwrap_or_else(PoisonError::into_inner) =
+                                                Some(*id);
+                                        }
+                                    }
+                                });
+                            }
+                        },
+                    );
+                });
+        });
+        false
+    }
+
+    /// The same, as a full-window panel for a host that works with a `Context` instead of a `Ui`.
+    pub fn show(&mut self, ctx: &egui::Context) -> bool {
+        if self.poll() {
+            return true;
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.ui(ui);
+        });
+        false
+    }
+}
+
+// ---- the AI settings --------------------------------------------------------------------------
 
 /// Which screen of the setup flow is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,11 +296,22 @@ impl AiState {
         s
     }
 
+    /// Re-read the credential file (the gate may have written it since `new`).
+    pub fn reload_credential(&mut self) {
+        self.credential = credential::read(self.app.slug);
+    }
+
     pub fn provider(&self) -> Provider {
         crate::resolve(&self.app, &self.settings)
     }
 
-    /// Show the setup flow on this launch: nothing chosen yet and the flow never ran to an end.
+    /// The answer the person gave the gate's plan screen, if any.
+    pub fn choice(&self) -> Option<Choice> {
+        crate::choice(&self.app, &self.settings)
+    }
+
+    /// Show the setup flow on this launch: nothing usable yet and the flow never ran to an end.
+    /// After "Use my own key" at the gate, this opens the own-key form.
     pub fn wants_first_run(&self) -> bool {
         !self.settings.setup_done && !self.provider().is_set_up()
     }
@@ -117,8 +323,11 @@ impl AiState {
 
     pub fn begin(&mut self) {
         self.error = None;
+        self.reload_credential();
         self.step = if self.owes_first_card() {
             Step::Card
+        } else if self.choice() == Some(Choice::OwnKey) && !self.provider().is_set_up() {
+            Step::OwnKey
         } else {
             Step::Pick
         };
@@ -198,12 +407,7 @@ impl AiState {
             match ev {
                 Event::Provisioned(Ok(c)) => {
                     self.credential = Some(c);
-                    self.settings.provider = PROVIDER_PUBLIK.into();
-                    self.settings.disclosure_accepted = DISCLOSURE_VERSION;
-                    self.settings.setup_done = true;
-                    self.save();
-                    self.error = None;
-                    self.step = Step::Card;
+                    self.use_publik();
                 }
                 Event::Provisioned(Err(e)) => {
                     self.error = Some(e);
@@ -220,6 +424,7 @@ impl AiState {
                     self.settings.own_base_url = self.base_url_draft.trim().to_string();
                     self.settings.own_model = self.model_draft.trim().to_string();
                     self.settings.setup_done = true;
+                    crate::set_choice(&self.app, Some(Choice::OwnKey));
                     self.save();
                     self.error = None;
                     self.step = Step::OwnKey;
@@ -235,11 +440,28 @@ impl AiState {
         }
     }
 
+    /// The person chose publik API with a credential on disk: store the choice, show the card.
+    fn use_publik(&mut self) {
+        self.settings.provider = PROVIDER_PUBLIK.into();
+        self.settings.disclosure_accepted = DISCLOSURE_VERSION;
+        self.settings.setup_done = true;
+        crate::set_choice(&self.app, Some(Choice::Publik));
+        self.save();
+        self.error = None;
+        self.step = Step::Card;
+    }
+
     pub fn busy(&self) -> bool {
         self.rx.is_some()
     }
 
     fn start_provision(&mut self, ctx: &egui::Context) {
+        self.reload_credential();
+        if self.credential.is_some() {
+            // The gate provisioned this computer at start-up.
+            self.use_publik();
+            return;
+        }
         let (tx, rx) = channel();
         let app = self.app.clone();
         let ctx = ctx.clone();
@@ -283,6 +505,7 @@ impl AiState {
         if f.reprovision {
             credential::forget(self.app.slug);
             self.credential = None;
+            gate::ask_again();
         }
     }
 
@@ -363,10 +586,12 @@ impl AiState {
                     ui.label(RichText::new("· in use").weak());
                 }
             });
-            ui.label("No key to paste. Priced per use in dollars from a publik balance; link this computer once for $0.05 of free use.");
+            ui.label(
+                "No key to paste. Priced per use in dollars from your publik plan or balance.",
+            );
             ui.add_space(4.0);
             if self.app.can_provision() {
-                if Self::primary(ui, "Use publik API").clicked() {
+                if Self::primary(ui, "Connect your plan").clicked() {
                     self.error = None;
                     self.step = Step::Disclosure;
                 }
@@ -592,13 +817,6 @@ impl AiState {
                     if ui.button("Dashboard").clicked() {
                         action = Action::OpenUrl(crate::DASHBOARD_URL.into());
                     }
-                    if ui.button("Forget this computer's key").clicked() {
-                        credential::forget(self.app.slug);
-                        self.credential = None;
-                        self.settings.provider = String::new();
-                        self.settings.first_card_shown = false;
-                        self.save();
-                    }
                 }
                 (Provider::Own { .. }, _) => {
                     let remove = ui.button("Remove key").clicked();
@@ -607,10 +825,20 @@ impl AiState {
                         self.settings.provider = String::new();
                         self.key_draft = String::new();
                         self.probed = None;
+                        crate::set_choice(&self.app, None);
                         self.save();
                     }
                 }
                 _ => {}
+            }
+            if cred.is_some() && ui.button("Sign out of publik on this computer").clicked() {
+                // Forgets this computer's key; the gate asks for a sign-in again at once.
+                credential::forget(self.app.slug);
+                self.credential = None;
+                self.settings.provider = String::new();
+                self.settings.first_card_shown = false;
+                self.save();
+                gate::ask_again();
             }
         });
         if let Some(c) = &self.credential {

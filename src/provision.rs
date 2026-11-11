@@ -1,12 +1,12 @@
-//! `POST /installs`: mint this computer's key for this app. Called only after
-//! the disclosure was accepted (the builder's self-test is its own consent).
+//! `POST /api/v1/installs`: mint this computer's key for this app. The gate calls it at
+//! start-up, before the sign-in screen (the key is anonymous until the person signs in).
 
 use serde_json::{json, Value};
 
 use crate::credential::{self, Credential};
-use crate::{http, AppInfo, DEFAULT_BASE_URL, DISCLOSURE_VERSION};
+use crate::{http, AppInfo, DISCLOSURE_VERSION};
 
-fn os_name() -> &'static str {
+pub(crate) fn os_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
     } else if cfg!(windows) {
@@ -25,17 +25,19 @@ fn arch_name() -> &'static str {
 }
 
 fn os_version() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()?;
-        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return if v.is_empty() { None } else { Some(v) };
+    if !cfg!(target_os = "macos") {
+        return None;
     }
-    #[allow(unreachable_code)]
-    None
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 fn token(app: &AppInfo) -> Option<String> {
@@ -52,7 +54,7 @@ fn token(app: &AppInfo) -> Option<String> {
     }
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -73,12 +75,13 @@ fn now_rfc3339() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Err is a readable message; offer the person's own key then.
+/// Err is a readable message (the gate shows it with Retry).
 pub fn provision(app: &AppInfo) -> Result<Credential, String> {
     let Some(token) = token(app) else {
-        return Err("This build has no publik API app token. Use your own key for now.".into());
+        return Err(
+            "This build has no publik app token. Ask the developer for a new build.".into(),
+        );
     };
-    let base = crate::resolve_base_url("");
     let mut prior = credential::read(app.slug);
     let mut install_id = prior
         .as_ref()
@@ -99,7 +102,8 @@ pub fn provision(app: &AppInfo) -> Result<Credential, String> {
         if let Some(v) = os_version() {
             body["os_version"] = Value::String(v);
         }
-        let res = http::post_json(&format!("{base}/installs"), None, &body, 25)?;
+        let res = http::post_json(&crate::api_url(app.endpoints.installs), None, &body, 25)
+            .map_err(|_| crate::gate::UNREACHABLE.to_string())?;
         let v = res.json();
         let key = v["key"].as_str().map(str::to_string).or_else(|| {
             if res.status == 200 {
@@ -113,8 +117,8 @@ pub fn provision(app: &AppInfo) -> Result<Credential, String> {
                 key,
                 base_url: v["base_url"]
                     .as_str()
-                    .unwrap_or(DEFAULT_BASE_URL)
-                    .to_string(),
+                    .map(str::to_string)
+                    .unwrap_or_else(crate::default_base_url),
                 install_id: v["install_id"].as_str().unwrap_or(&install_id).to_string(),
                 app_slug: app.slug.to_string(),
                 claim_url: crate::publik_link(v["claim_url"].as_str()).unwrap_or_default(),
@@ -131,8 +135,10 @@ pub fn provision(app: &AppInfo) -> Result<Credential, String> {
                     .to_string(),
                 balance_micros: v["balance_micros"].as_i64(),
                 minted_at: now_rfc3339(),
+                // The answer to the plan screen outlives a re-mint of the same install.
+                choice: prior.as_ref().and_then(|c| c.choice.clone()),
             };
-            credential::write(app.slug, &c)?;
+            credential::write(app.slug, &c)?; // the key reaches disk before anything else sees it
             return Ok(c);
         }
         // A replayed install whose key is gone, or a revoked install: mint a fresh one once.
@@ -145,13 +151,10 @@ pub fn provision(app: &AppInfo) -> Result<Credential, String> {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| {
-                format!(
-                    "publik API could not set up this computer ({}). Use your own key for now.",
-                    res.status
-                )
+                format!("publik could not set up this computer ({}).", res.status)
             }));
     }
-    Err("publik API could not set up this computer. Use your own key for now.".into())
+    Err("publik could not set up this computer.".into())
 }
 
 #[cfg(test)]

@@ -116,7 +116,7 @@ pub fn send(req: &Request<'_>) -> Result<Response, String> {
         "-H".into(),
         "Expect:".into(),
         "-A".into(),
-        "craft-publik/0.1".into(),
+        "craft-publik/0.2".into(),
     ];
     for (k, v) in &req.headers {
         args.push("-H".into());
