@@ -197,17 +197,6 @@ impl Gate {
         });
         false
     }
-
-    /// The same, as a full-window panel for a host that works with a `Context` instead of a `Ui`.
-    pub fn show(&mut self, ctx: &egui::Context) -> bool {
-        if self.poll() {
-            return true;
-        }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.ui(ui);
-        });
-        false
-    }
 }
 
 // ---- the AI settings --------------------------------------------------------------------------
