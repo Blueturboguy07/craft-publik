@@ -106,6 +106,21 @@ impl Gate {
         });
     }
 
+    /// A gate that is already past, for a unit test that builds the host's app struct without a
+    /// window. It signs nobody in and counts nobody; never use it on a start-up path.
+    #[doc(hidden)]
+    pub fn for_test(app: AppInfo) -> Self {
+        Gate {
+            app,
+            slot: Arc::new(Mutex::new(None)),
+            rx: None,
+            passed: Some(Passed {
+                wallet: serde_json::Value::Null,
+                choice: None,
+            }),
+        }
+    }
+
     /// True once the gate passed in this process.
     pub fn passed(&self) -> bool {
         self.passed.is_some()
