@@ -316,9 +316,13 @@ impl AiState {
         !self.settings.setup_done && !self.provider().is_set_up()
     }
 
-    /// A publik install that was set up but never shown its first-run card.
+    /// A publik install set up from this flow (not from the gate) and never shown its first-run
+    /// card.
     pub fn owes_first_card(&self) -> bool {
-        self.provider().is_publik() && self.credential.is_some() && !self.settings.first_card_shown
+        self.settings.provider == PROVIDER_PUBLIK
+            && self.provider().is_publik()
+            && self.credential.is_some()
+            && !self.settings.first_card_shown
     }
 
     pub fn begin(&mut self) {
@@ -787,6 +791,9 @@ impl AiState {
     /// The AI section of the app's Options page. `open_setup` is set when the person wants the flow.
     pub fn options_ui(&mut self, ui: &mut Ui, open_setup: &mut bool) -> Action {
         self.poll();
+        if self.credential.is_none() {
+            self.reload_credential();
+        }
         self.refresh_wallet(ui.ctx());
         let mut action = Action::None;
         let p = self.provider();
@@ -868,6 +875,9 @@ impl AiState {
 
     /// A small bar a feature shows under its result: the notice (with its one link) or the charge.
     pub fn result_bar(&mut self, ui: &mut Ui) -> Action {
+        if self.credential.is_none() {
+            self.reload_credential();
+        }
         self.refresh_wallet(ui.ctx());
         self.poll();
         let mut action = Action::None;
