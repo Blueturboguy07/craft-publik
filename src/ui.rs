@@ -8,7 +8,57 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use egui::{RichText, Ui};
+use egui::{Color32, FontFamily, FontId, RichText, Ui};
+
+/// The gate card's own ink: one look on every host, whatever its theme. A host's heading font
+/// may lack Latin glyphs (VectorCraft drew the title as empty boxes) and its text colour may sit
+/// close to its background (GridCraft, PdfCraft and WordCraft drew dark grey on black), so the
+/// card names its font family and its colours instead of inheriting them.
+#[derive(Clone, Copy)]
+struct CardInk {
+    fg: Color32,
+    soft: Color32,
+    fill: Color32,
+    line: Color32,
+}
+
+impl CardInk {
+    fn for_ui(ui: &Ui) -> Self {
+        if ui.visuals().dark_mode {
+            Self {
+                fg: Color32::from_rgb(236, 236, 240),
+                soft: Color32::from_rgb(176, 176, 182),
+                fill: Color32::from_rgb(20, 20, 22),
+                line: Color32::from_rgb(58, 58, 64),
+            }
+        } else {
+            Self {
+                fg: Color32::from_rgb(24, 24, 27),
+                soft: Color32::from_rgb(95, 95, 102),
+                fill: Color32::from_rgb(247, 247, 248),
+                line: Color32::from_rgb(214, 214, 220),
+            }
+        }
+    }
+
+    fn text(&self, s: impl Into<String>, size: f32, color: Color32) -> RichText {
+        RichText::new(s)
+            .font(FontId::new(size, FontFamily::Proportional))
+            .color(color)
+    }
+
+    fn heading(&self, s: impl Into<String>) -> RichText {
+        self.text(s, 22.0, self.fg).strong()
+    }
+
+    fn body(&self, s: impl Into<String>) -> RichText {
+        self.text(s, 15.0, self.fg)
+    }
+
+    fn note(&self, s: impl Into<String>) -> RichText {
+        self.text(s, 13.0, self.soft)
+    }
+}
 
 use crate::client::{Fail, Reply};
 use crate::credential::{self, Credential};
@@ -159,7 +209,10 @@ impl Gate {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.25).max(24.0));
             ui.set_max_width(460.0);
+            let ink = CardInk::for_ui(ui);
             egui::Frame::group(ui.style())
+                .fill(ink.fill)
+                .stroke(egui::Stroke::new(1.0, ink.line))
                 .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width().min(428.0));
@@ -167,24 +220,24 @@ impl Gate {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| match &shown {
                             None => {
-                                ui.label(RichText::new("Sign in with publik").heading());
+                                ui.label(ink.heading("Sign in with publik"));
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.label("Connecting to publik…");
+                                    ui.label(ink.body("Connecting to publik…"));
                                 });
                             }
                             Some((s, pressed)) => {
-                                ui.label(RichText::new(s.title).heading());
+                                ui.label(ink.heading(s.title));
                                 ui.add_space(6.0);
-                                ui.label(&s.body);
+                                ui.label(ink.body(s.body.as_str()));
                                 if let Some(n) = s.note {
                                     ui.add_space(4.0);
                                     ui.horizontal(|ui| {
                                         if n.starts_with("Waiting") {
                                             ui.spinner();
                                         }
-                                        ui.label(RichText::new(n).weak());
+                                        ui.label(ink.note(n));
                                     });
                                 }
                                 ui.add_space(10.0);
@@ -193,7 +246,7 @@ impl Gate {
                                         let clicked = if i == 0 {
                                             AiState::primary(ui, label).clicked()
                                         } else {
-                                            ui.button(*label).clicked()
+                                            ui.add(egui::Button::new(ink.body(*label))).clicked()
                                         };
                                         if clicked {
                                             *pressed
@@ -549,14 +602,16 @@ impl AiState {
         }
     }
 
+    /// The blue button, the same on every host: white words on publik's blue, in the
+    /// proportional family, whatever the host's selection colours are.
     fn primary(ui: &mut Ui, label: &str) -> egui::Response {
-        let fill = ui.visuals().selection.bg_fill;
         let text = RichText::new(label)
+            .font(FontId::new(15.0, FontFamily::Proportional))
             .strong()
-            .color(ui.visuals().selection.stroke.color);
+            .color(Color32::WHITE);
         ui.add(
             egui::Button::new(text)
-                .fill(fill)
+                .fill(Color32::from_rgb(59, 130, 246))
                 .min_size(egui::vec2(0.0, 26.0)),
         )
     }
